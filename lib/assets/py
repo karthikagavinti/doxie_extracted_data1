@@ -1,0 +1,744 @@
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends
+from fastapi.responses import RedirectResponse, Response, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Dict, Any, List
+import json
+import logging
+import os
+import asyncio
+import io
+from datetime import datetime
+from pymongo import MongoClient
+from dotenv import load_dotenv
+import boto3
+from botocore.exceptions import ClientError
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+
+# Load environment variables
+load_dotenv()
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# WebSocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, document_id: str):
+        await websocket.accept()
+        if document_id not in self.active_connections:
+            self.active_connections[document_id] = []
+        self.active_connections[document_id].append(websocket)
+        logger.info(f"Client connected to document {document_id}. Total connections: {len(self.active_connections[document_id])}")
+
+    def disconnect(self, websocket: WebSocket, document_id: str):
+        if document_id in self.active_connections:
+            if websocket in self.active_connections[document_id]:
+                self.active_connections[document_id].remove(websocket)
+            if not self.active_connections[document_id]:
+                del self.active_connections[document_id]
+            logger.info(f"Client disconnected from document {document_id}")
+
+    async def broadcast_update(self, document_id: str, message: dict):
+        if document_id in self.active_connections:
+            for connection in self.active_connections[document_id]:
+                await connection.send_text(json.dumps(message))
+            logger.info(f"Update broadcast to {len(self.active_connections[document_id])} clients for document {document_id}")
+
+manager = ConnectionManager()
+
+# MongoDB connection
+def connect_to_mongodb():
+    try:
+        mongo_uri = os.getenv('MONGO_URI')
+        db_name = os.getenv('MONGO_DB_NAME')
+        collection_name = os.getenv('MONGO_COLLECTION_NAME')
+        
+        if not mongo_uri or not db_name or not collection_name:
+            logger.error("MongoDB connection details missing in environment variables")
+            raise ValueError("MongoDB connection details missing")
+        
+        client = MongoClient(mongo_uri)
+        db = client[db_name]
+        collection = db[collection_name]
+        logger.info(f"Connected to MongoDB database: {db_name}, collection: {collection_name}")
+        return collection
+    except Exception as e:
+        logger.error(f"Failed to connect to MongoDB: {str(e)}")
+        raise
+
+# S3 connection
+def get_s3_client():
+    try:
+        aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
+        aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+        aws_region = os.getenv('AWS_REGION', 'us-east-1')
+        
+        if not aws_access_key or not aws_secret_key:
+            logger.error("AWS credentials missing in environment variables")
+            raise ValueError("AWS credentials missing")
+        
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key,
+            region_name=aws_region
+        )
+        logger.info("Connected to AWS S3")
+        return s3_client
+    except Exception as e:
+        logger.error(f"Failed to connect to AWS S3: {str(e)}")
+        raise
+
+# Function to download PDF from S3 using boto3 (from connection_mongodb)
+def download_pdf_from_s3(s3_url: str, filename: str) -> bool:
+    try:
+        # Get bucket name from .env
+        bucket = os.getenv('S3_BUCKET_NAME')
+        if not bucket:
+            raise ValueError("S3_BUCKET_NAME not set in .env")
+        
+        # Extract the key from the s3_url
+        # Example: https://hemsaw-po.s3.amazonaws.com/uploads/TYA6NNQT_4-purchase%20order.pdf
+        key = '/'.join(s3_url.split('/')[3:])  # 'uploads/TYA6NNQT_4-purchase order.pdf'
+        
+        # Initialize S3 client with credentials from .env
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+            region_name=os.getenv('AWS_REGION')
+        )
+        
+        # Download the file
+        s3.download_file(bucket, key, filename)
+        logger.info(f"PDF downloaded successfully: {filename}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to download PDF: {str(e)}")
+        return False
+
+# Models
+class DocumentUpdateModel(BaseModel):
+    file_id: str
+    metadata: Dict[str, Any]
+
+# Root endpoint
+@app.get("/")
+async def root():
+    return {"message": "PDF API is running"}
+
+# Debug endpoint to check document structure
+@app.get("/debug/{file_id}")
+async def debug_document(file_id: str):
+    try:
+        collection = connect_to_mongodb()
+        
+        # Try with and without .pdf extension
+        clean_file_id = file_id.replace('.pdf', '')
+        document = collection.find_one({"file_id": clean_file_id})
+        
+        # If not found with clean_file_id, try with the original file_id
+        if not document:
+            document = collection.find_one({"file_id": file_id})
+        
+        if not document:
+            return {"error": "Document not found"}
+        
+        # Convert ObjectId to string
+        if "_id" in document:
+            document["_id"] = str(document["_id"])
+        
+        return {
+            "document": document,
+            "s3_fields_found": [field for field in ["s3_url", "pdf_url", "url", "file_url", "download_url", "link", "s3_bucket", "s3_key"] if field in document]
+        }
+    except Exception as e:
+        logger.error(f"Error in debug_document: {str(e)}")
+        return {"error": str(e)}
+
+# Get all PDF documents from MongoDB (using connection_mongodb approach)
+@app.get("/get_all_pdf_data")
+async def get_all_pdf_data():
+    try:
+        # Connect to MongoDB
+        collection = connect_to_mongodb()
+        
+        # Fetch all documents from the collection
+        documents = list(collection.find({}))
+        if not documents:
+            logger.info("No documents found in the collection")
+            return {"message": "No documents available", "data": []}
+        
+        logger.info(f"Retrieved {len(documents)} documents from MongoDB")
+        
+        # Prepare response data
+        response_data = []
+        
+        for document in documents:
+            # Extract S3 URL
+            s3_url = None
+            possible_fields = ["s3_url", "pdf_url", "url", "file_url", "download_url", "link"]
+            
+            for field in possible_fields:
+                if field in document and document[field]:
+                    s3_url = document[field]
+                    logger.info(f"Found S3 URL in field '{field}': {s3_url}")
+                    break
+            
+            if not s3_url:
+                logger.warning(f"No S3 URL found for document with ID: {document.get('_id')}")
+                continue
+            
+            # Generate unique filename with timestamp and file_id
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            file_id = document.get('file_id', 'unknown')
+            filename = f"downloaded_pdf_{file_id}_{timestamp}.pdf"
+            
+            # Download PDF using boto3
+            success = download_pdf_from_s3(s3_url, filename)
+            if not success:
+                logger.warning(f"Failed to download PDF for document with ID: {document.get('_id')}")
+                continue
+            
+            # Prepare metadata
+            metadata = {
+                key: value for key, value in document.items()
+                if key != '_id'  # Optionally keep '_id' if needed
+            }
+            
+            # Add to response
+            response_data.append({
+                'metadata': metadata,
+                'pdf': f"/download/{filename}",
+                'status': 'success'
+            })
+        
+        logger.info(f"Prepared response with {len(response_data)} documents")
+        return {"data": response_data}
+    
+    except Exception as e:
+        logger.error(f"Error in get_all_pdf_data: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Download file endpoint (from connection_mongodb)
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    try:
+        file_path = os.path.join(os.getcwd(), filename)
+        
+        # Check if file exists
+        if os.path.exists(file_path):
+            logger.info(f"Sending PDF file: {filename}")
+            return FileResponse(file_path, media_type='application/pdf', filename=filename)
+        else:
+            # Try to find a file with a similar name (in case timestamp is different)
+            if '_' in filename:
+                file_id_part = filename.split('_')[1]  # Extract file_id part
+                matching_files = [f for f in os.listdir() if f.startswith(f"downloaded_pdf_{file_id_part}_") and f.endswith('.pdf')]
+                
+                if matching_files:
+                    # Use the first matching file
+                    alternative_path = os.path.join(os.getcwd(), matching_files[0])
+                    logger.info(f"File {filename} not found, using alternative: {matching_files[0]}")
+                    return FileResponse(alternative_path, media_type='application/pdf', filename=matching_files[0])
+            
+            # If we get here, no file was found
+            logger.error(f"File not found: {filename}")
+            raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+    except Exception as e:
+        logger.error(f"Error in download_file: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Keep the original download endpoint for backward compatibility
+@app.get("/download/{file_id}.pdf")
+async def download_pdf_file(file_id: str):
+    try:
+        # Connect to MongoDB to get document details
+        collection = connect_to_mongodb()
+        
+        # Find the document by file_id
+        # Remove .pdf extension if it's part of the file_id parameter
+        clean_file_id = file_id.replace('.pdf', '')
+        document = collection.find_one({"file_id": clean_file_id})
+        
+        # If not found with clean_file_id, try with the original file_id
+        if not document:
+            document = collection.find_one({"file_id": file_id})
+        
+        if not document:
+            logger.error(f"Document with file_id {file_id} not found in MongoDB")
+            
+            # Generate a fallback PDF with error message instead of returning 404
+            buffer = io.BytesIO()
+            c = canvas.Canvas(buffer, pagesize=letter)
+            
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(100, 750, "Document Not Found")
+            
+            c.setFont("Helvetica", 12)
+            c.drawString(100, 730, f"The document with ID '{file_id}' could not be found.")
+            c.drawString(100, 710, "Please check the document ID and try again.")
+            c.drawString(100, 690, f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            c.setFont("Helvetica", 10)
+            c.drawString(280, 50, "Error Page")
+            
+            c.save()
+            
+            # Get the PDF content
+            buffer.seek(0)
+            pdf_content = buffer.getvalue()
+            
+            logger.info(f"Generated error PDF for non-existent document {file_id}")
+            
+            return Response(
+                content=pdf_content,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f"attachment; filename=error_{file_id}.pdf",
+                    "Content-Type": "application/pdf"
+                }
+            )
+        
+        # Get S3 URL from document - check different possible field names
+        s3_url = None
+        possible_fields = ["s3_url", "pdf_url", "url", "file_url", "download_url", "link"]
+        
+        for field in possible_fields:
+            if field in document and document[field]:
+                s3_url = document[field]
+                logger.info(f"Found S3 URL in field '{field}': {s3_url}")
+                break
+        
+        if s3_url:
+            # Generate unique filename with timestamp and file_id
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"downloaded_pdf_{file_id}_{timestamp}.pdf"
+            
+            # Download PDF using boto3
+            success = download_pdf_from_s3(s3_url, filename)
+            if success:
+                file_path = os.path.join(os.getcwd(), filename)
+                logger.info(f"Sending PDF file: {filename}")
+                return FileResponse(file_path, media_type='application/pdf', filename=filename)
+        
+        # If direct download failed or no S3 URL, continue with original fallback methods
+        
+        # If no direct URL found, try to construct from bucket and key
+        if not s3_url:
+            s3_bucket = document.get("s3_bucket")
+            s3_key = document.get("s3_key")
+            
+            if not s3_bucket or not s3_key:
+                s3_bucket = os.getenv("S3_BUCKET_NAME")
+                cloud_folder = os.getenv("CLOUD_FOLDER", "")
+                
+                # Try to construct a key from document properties
+                if "original_filename" in document:
+                    filename = document["original_filename"]
+                    if not filename.lower().endswith('.pdf'):
+                        filename += '.pdf'
+                    
+                    s3_key = f"{cloud_folder}/{filename}" if cloud_folder else filename
+                    
+                    # Set default bucket and key
+                    document["s3_bucket"] = s3_bucket
+                    document["s3_key"] = s3_key
+                    
+                    # Update document with S3 details for future use
+                    collection.update_one(
+                        {"file_id": file_id},
+                        {"$set": {"s3_bucket": s3_bucket, "s3_key": s3_key}}
+                    )
+                    
+                    logger.info(f"Added S3 details to document {file_id}: bucket={s3_bucket}, key={s3_key}")
+                else:
+                    logger.warning(f"No S3 URL or filename found for document {file_id}, will generate fallback PDF")
+        
+        # If we have a direct S3 URL, redirect to it
+        if s3_url and s3_url.startswith('http'):
+            logger.info(f"Redirecting to S3 URL for {file_id}: {s3_url}")
+            return RedirectResponse(url=s3_url)
+        
+        # Get S3 client
+        s3_client = get_s3_client()
+        
+        # Try to use bucket and key if available
+        s3_bucket = document.get("s3_bucket")
+        s3_key = document.get("s3_key")
+        
+        if s3_bucket and s3_key:
+            try:
+                # Generate a presigned URL for direct download
+                presigned_url = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': s3_bucket, 'Key': s3_key},
+                    ExpiresIn=3600  # URL expires in 1 hour
+                )
+                
+                logger.info(f"Generated presigned URL for {file_id} from S3 bucket {s3_bucket}")
+                
+                # Redirect to the presigned URL
+                return RedirectResponse(url=presigned_url)
+                
+            except ClientError as e:
+                logger.error(f"Error generating presigned URL: {e}")
+                
+                # Try direct download from S3
+                try:
+                    response = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+                    pdf_content = response['Body'].read()
+                    
+                    logger.info(f"Downloaded PDF for {file_id} from S3 bucket {s3_bucket}, size: {len(pdf_content)} bytes")
+                    
+                    return Response(
+                        content=pdf_content,
+                        media_type="application/pdf",
+                        headers={
+                            "Content-Disposition": f"attachment; filename={file_id}.pdf",
+                            "Content-Type": "application/pdf"
+                        }
+                    )
+                except ClientError as s3_error:
+                    logger.error(f"Error downloading from S3: {s3_error}")
+                    # Fall through to fallback PDF generation
+        
+        # Fallback: Generate a PDF with document metadata
+        logger.info(f"Generating fallback PDF for {file_id}")
+        
+        # Create a PDF in memory
+        buffer = io.BytesIO()
+        c = canvas.Canvas(buffer, pagesize=letter)
+        
+        # Add content to the PDF
+        c.setFont("Helvetica-Bold", 16)
+        title = document.get('title', 'Untitled Document')
+        c.drawString(100, 750, title)
+        
+        c.setFont("Helvetica", 12)
+        c.drawString(100, 730, f"Document ID: {file_id}")
+        
+        # Add original filename if available
+        original_filename = document.get('original_filename', '')
+        if original_filename:
+            c.drawString(100, 710, f"Original Filename: {original_filename}")
+        
+        # Add more document metadata
+        y_position = 690
+        for key, value in document.items():
+            if key not in ['_id', 'file_id', 'title', 'original_filename']:
+                if isinstance(value, (str, int, float)):
+                    y_position -= 20
+                    value_str = str(value)
+                    # Truncate long values
+                    if len(value_str) > 60:
+                        value_str = value_str[:57] + "..."
+                    c.drawString(100, y_position, f"{key}: {value_str}")
+        
+        # Add a page number
+        c.setFont("Helvetica", 10)
+        c.drawString(280, 50, "Page 1")
+        
+        c.save()
+        
+        # Get the PDF content
+        buffer.seek(0)
+        pdf_content = buffer.getvalue()
+        
+        logger.info(f"Generated fallback PDF for {file_id} with size {len(pdf_content)} bytes")
+        
+        return Response(
+            content=pdf_content,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={file_id}.pdf",
+                "Content-Type": "application/pdf"
+            }
+        )
+    
+    except Exception as e:
+        logger.error(f"Error in download_pdf: {str(e)}")
+        
+        # Generate an error PDF instead of returning 500
+        buffer = io.BytesIO()
+        c = canvas.Canvas(buffer, pagesize=letter)
+        
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(100, 750, "Error Loading Document")
+        
+        c.setFont("Helvetica", 12)
+        c.drawString(100, 730, f"Document ID: {file_id}")
+        c.drawString(100, 710, f"Error: {str(e)}")
+        c.drawString(100, 690, "Please try again later or contact support.")
+        c.drawString(100, 670, f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        c.setFont("Helvetica", 10)
+        c.drawString(280, 50, "Error Page")
+        
+        c.save()
+        
+        # Get the PDF content
+        buffer.seek(0)
+        pdf_content = buffer.getvalue()
+        
+        logger.info(f"Generated error PDF for {file_id} due to exception: {str(e)}")
+        
+        return Response(
+            content=pdf_content,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename=error_{file_id}.pdf",
+                "Content-Type": "application/pdf"
+            }
+        )
+
+# Function to verify PDF files (from connection_mongodb)
+def verify_pdf_files():
+    """Check if all PDF files referenced in MongoDB actually exist on disk."""
+    try:
+        collection = connect_to_mongodb()
+        documents = list(collection.find({}))
+        
+        missing_files = []
+        for document in documents:
+            s3_url = None
+            possible_fields = ["s3_url", "pdf_url", "url", "file_url", "download_url", "link"]
+            
+            for field in possible_fields:
+                if field in document and document[field]:
+                    s3_url = document[field]
+                    break
+                    
+            if not s3_url:
+                continue
+                
+            file_id = document.get('file_id', 'unknown')
+            # Check for any files matching this file_id pattern
+            matching_files = [f for f in os.listdir() if f.startswith(f"downloaded_pdf_{file_id}_") and f.endswith('.pdf')]
+            
+            if not matching_files:
+                missing_files.append({
+                    'file_id': file_id,
+                    's3_url': s3_url
+                })
+        
+        return {
+            'total_documents': len(documents),
+            'missing_files': missing_files
+        }
+    except Exception as e:
+        logger.error(f"Error verifying PDF files: {str(e)}")
+        return {'error': str(e)}
+
+# Add verify files endpoint (from connection_mongodb)
+@app.get("/verify_files")
+async def verify_files():
+    result = verify_pdf_files()
+    return result
+
+# Refresh PDF endpoint (from connection_mongodb)
+@app.post("/refresh_pdf/{file_id}")
+async def refresh_pdf(file_id: str):
+    try:
+        # Connect to MongoDB
+        collection = connect_to_mongodb()
+        
+        # Find the document with this file_id
+        document = collection.find_one({"file_id": file_id})
+        if not document:
+            raise HTTPException(status_code=404, detail=f"Document with file_id {file_id} not found")
+        
+        # Extract S3 URL
+        s3_url = None
+        possible_fields = ["s3_url", "pdf_url", "url", "file_url", "download_url", "link"]
+        
+        for field in possible_fields:
+            if field in document and document[field]:
+                s3_url = document[field]
+                break
+                
+        if not s3_url:
+            raise HTTPException(status_code=400, detail=f"No S3 URL found for document with file_id {file_id}")
+        
+        # Generate unique filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"downloaded_pdf_{file_id}_{timestamp}.pdf"
+        
+        # Download PDF using boto3
+        success = download_pdf_from_s3(s3_url, filename)
+        if not success:
+            raise HTTPException(status_code=500, detail=f"Failed to download PDF from S3 for file_id {file_id}")
+        
+        return {
+            "status": "success",
+            "message": f"PDF refreshed successfully",
+            "pdf_path": f"/download/{filename}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in refresh_pdf: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Inspect document endpoint (from connection_mongodb)
+@app.get("/inspect_document/{file_id}")
+async def inspect_document(file_id: str):
+    try:
+        # Connect to MongoDB
+        collection = connect_to_mongodb()
+        
+        # Find the document with this file_id
+        document = collection.find_one({"file_id": file_id})
+        if not document:
+            raise HTTPException(status_code=404, detail=f"Document with file_id {file_id} not found")
+        
+        # Convert ObjectId to string for JSON serialization
+        if '_id' in document:
+            document['_id'] = str(document['_id'])
+        
+        return document
+    except Exception as e:
+        logger.error(f"Error in inspect_document: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# WebSocket endpoint for real-time updates
+@app.websocket("/ws/{document_id}")
+async def websocket_endpoint(websocket: WebSocket, document_id: str):
+    logger.info(f"WebSocket connection attempt for document: {document_id}")
+    await manager.connect(websocket, document_id)
+    try:
+        while True:
+            # Keep the connection alive and wait for messages
+            data = await websocket.receive_text()
+            logger.info(f"Received message from client: {data}")
+            # Echo the message back
+            await websocket.send_text(json.dumps({"type": "echo", "message": f"Echo: {data}"}))
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, document_id)
+        logger.info(f"WebSocket disconnected for document: {document_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error for document {document_id}: {e}")
+        try:
+            manager.disconnect(websocket, document_id)
+        except:
+            pass
+
+# Update document metadata in MongoDB
+@app.post("/update_document")
+async def update_document(update_data: DocumentUpdateModel):
+    try:
+        # Connect to MongoDB
+        collection = connect_to_mongodb()
+        
+        # Find the document by file_id
+        file_id = update_data.file_id
+        existing_document = collection.find_one({"file_id": file_id})
+        
+        if not existing_document:
+            logger.error(f"Document with file_id {file_id} not found")
+            return {"message": "Document not found", "success": False, "error": "Document not found"}
+        
+        # Clean the metadata to ensure it's compatible with MongoDB
+        cleaned_metadata = {}
+        for key, value in update_data.metadata.items():
+            # Skip _id field to avoid MongoDB errors
+            if key != "_id":
+                cleaned_metadata[key] = value
+        
+        # Update the document metadata
+        try:
+            result = collection.update_one(
+                {"file_id": file_id},
+                {"$set": cleaned_metadata}
+            )
+            
+            if result.modified_count == 0:
+                logger.warning(f"No changes made to document with file_id {file_id}")
+                return {"message": "No changes made", "success": True}
+        except Exception as e:
+            logger.error(f"MongoDB update error: {str(e)}")
+            return {"message": f"Database error: {str(e)}", "success": False, "error": str(e)}
+        
+        # Get the updated document to broadcast
+        updated_document = collection.find_one({"file_id": file_id})
+        if updated_document:
+            # Convert ObjectId to string for JSON serialization
+            if "_id" in updated_document:
+                updated_document["_id"] = str(updated_document["_id"])
+            
+            # Broadcast the update to all connected clients
+            try:
+                await manager.broadcast_update(
+                    file_id, 
+                    {
+                        "type": "document_updated",
+                        "data": {
+                            "metadata": updated_document,
+                            "pdf": f"/download/{updated_document.get('file_id')}.pdf",
+                            "status": "success"
+                        }
+                    }
+                )
+            except Exception as e:
+                logger.error(f"WebSocket broadcast error: {str(e)}")
+                # Continue even if broadcast fails
+        
+        logger.info(f"Document with file_id {file_id} updated successfully")
+        return {"message": "Document updated successfully", "success": True}
+    
+    except Exception as e:
+        logger.error(f"Error in update_document: {str(e)}")
+        return {"message": f"Error updating document: {str(e)}", "success": False, "error": str(e)}
+
+# Cleanup function
+def cleanup_old_files():
+    for file in os.listdir():
+        if file.startswith('downloaded_pdf_') and file.endswith('.pdf'):
+            try:
+                os.remove(file)
+                logger.info(f"Cleaned up old file: {file}")
+            except Exception as e:
+                logger.warning(f"Could not clean up file {file}: {str(e)}")
+
+# Start the server
+if __name__ == "__main__":
+    import uvicorn
+    # Clean up old files on startup
+    cleanup_old_files()
+    
+    print("Starting FastAPI server with MongoDB and S3 integration...")
+    print("Required environment variables:")
+    print("- MONGO_URI: MongoDB connection string")
+    print("- MONGO_DB_NAME: MongoDB database name")
+    print("- MONGO_COLLECTION_NAME: MongoDB collection name")
+    print("- AWS_ACCESS_KEY_ID: AWS access key")
+    print("- AWS_SECRET_ACCESS_KEY: AWS secret key")
+    print("- AWS_REGION: AWS region (default: us-east-1)")
+    print("- S3_BUCKET_NAME: S3 bucket name")
+    
+    # Get port from env or use default
+    port = int(os.getenv('PORT', 3001))
+    
+    logger.info(f"Starting FastAPI application on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
