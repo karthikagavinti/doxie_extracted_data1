@@ -29,7 +29,6 @@ class PdfDocument {
       }
     }
     
-    
     // Ensure the URL is properly formatted
     if (!pdfUrl.startsWith('/') && !pdfUrl.startsWith('http')) {
       pdfUrl = '/$pdfUrl';

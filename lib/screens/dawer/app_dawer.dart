@@ -1,20 +1,91 @@
+import 'package:doxie_dummy_pdf/models/pdf_document.dart';
+import 'package:doxie_dummy_pdf/screens/dawer/help_support.dart';
+import 'package:doxie_dummy_pdf/screens/dawer/verificcation_queue.dart';
 import 'package:doxie_dummy_pdf/theme/app_theme.dart';
+import 'package:doxie_dummy_pdf/services/api_service.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:percent_indicator/circular_percent_indicator.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 
 class AppDrawer extends StatefulWidget {
-  const AppDrawer({Key? key}) : super(key: key);
+  final ApiService? apiService;
+  final List<PdfDocument>? documents;
+  final Function(PdfDocument)? onDocumentUpdated;
+
+  const AppDrawer({
+    Key? key,
+    this.apiService,
+    this.documents,
+    this.onDocumentUpdated,
+  }) : super(key: key);
 
   @override
   State<AppDrawer> createState() => _AppDrawerState();
 }
 
 class _AppDrawerState extends State<AppDrawer> {
-  final double _storageUsed = 4.2; // GB
-  final double _totalStorage = 15.0; // GB
-  final double usagePercentage = 1.4 / 5.0;
+  bool _isLoading = true;
+  int _totalDocuments = 0;
+  int _verifiedDocuments = 0;
+  int _pendingDocuments = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadStorageInfo();
+  }
+
+  void _loadStorageInfo() {
+    setState(() {
+      _isLoading = true;
+    });
+
+    if (widget.documents != null && widget.documents!.isNotEmpty) {
+      _calculateStorageInfo(widget.documents!);
+    } else if (widget.apiService != null) {
+      widget.apiService!
+          .getAllPdfDocuments()
+          .then((docs) {
+            if (mounted) {
+              _calculateStorageInfo(docs);
+            }
+          })
+          .catchError((error) {
+            if (mounted) {
+              setState(() {
+                _isLoading = false;
+              });
+            }
+          });
+    } else {
+      // Use default values if no documents or API service
+      setState(() {
+        _totalDocuments = 0;
+        _verifiedDocuments = 0;
+        _pendingDocuments = 0;
+        _isLoading = false;
+      });
+    }
+  }
+
+  void _calculateStorageInfo(List<PdfDocument> documents) {
+    // Count documents by status
+    _totalDocuments = documents.length;
+    _verifiedDocuments =
+        documents
+            .where(
+              (doc) =>
+                  doc.metadata.containsKey('status') &&
+                  doc.metadata['status'] == 'Verified',
+            )
+            .length;
+    _pendingDocuments = _totalDocuments - _verifiedDocuments;
+
+    setState(() {
+      _isLoading = false;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -27,7 +98,7 @@ class _AppDrawerState extends State<AppDrawer> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             _buildProfileSection(size),
-            _buildStorageInfo(size),
+            _buildEnhancedDocumentInfo(size),
             Expanded(child: _buildNavigationItems()),
           ],
         ).animate().fade(duration: 300.ms),
@@ -133,7 +204,7 @@ class _AppDrawerState extends State<AppDrawer> {
     );
   }
 
-  Widget _buildStorageInfo(Size size) {
+  Widget _buildEnhancedDocumentInfo(Size size) {
     return Container(
       margin: const EdgeInsets.all(16),
       padding: const EdgeInsets.all(16),
@@ -157,7 +228,7 @@ class _AppDrawerState extends State<AppDrawer> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
-                "Storage",
+                "Documents",
                 style: GoogleFonts.poppins(
                   textStyle: TextStyle(
                     fontSize: 16,
@@ -167,7 +238,7 @@ class _AppDrawerState extends State<AppDrawer> {
                 ),
               ),
               Text(
-                "$_storageUsed GB of $_totalStorage GB used",
+                "$_totalDocuments total documents",
                 style: GoogleFonts.poppins(
                   textStyle: TextStyle(
                     fontSize: 12,
@@ -180,21 +251,25 @@ class _AppDrawerState extends State<AppDrawer> {
           const SizedBox(height: 16),
           Row(
             children: [
+              // Circular indicator showing verified/total ratio
               CircularPercentIndicator(
                 radius: 30.0,
                 lineWidth: 6.0,
-                percent: usagePercentage,
+                percent:
+                    _totalDocuments > 0
+                        ? _verifiedDocuments / _totalDocuments
+                        : 0.0,
                 center: Text(
-                  "${(usagePercentage * 100).toStringAsFixed(0)}%",
+                  "${_totalDocuments > 0 ? ((_verifiedDocuments / _totalDocuments) * 100).toStringAsFixed(0) : 0}%",
                   style: GoogleFonts.poppins(
-                    textStyle: TextStyle(
+                    textStyle: const TextStyle(
                       fontWeight: FontWeight.w600,
                       fontSize: 12,
-                      color: AppTheme.primaryColor,
+                      color: Colors.green,
                     ),
                   ),
                 ),
-                progressColor: AppTheme.primaryColor,
+                progressColor: Colors.green,
                 backgroundColor: Colors.grey.shade200,
                 circularStrokeCap: CircularStrokeCap.round,
                 animation: true,
@@ -205,6 +280,7 @@ class _AppDrawerState extends State<AppDrawer> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    // Linear progress bar showing verified/total ratio
                     Container(
                       height: 8,
                       decoration: BoxDecoration(
@@ -216,13 +292,15 @@ class _AppDrawerState extends State<AppDrawer> {
                           Container(
                             width:
                                 (size.width - 32 - 32 - 60 - 16) *
-                                usagePercentage,
+                                (_totalDocuments > 0
+                                    ? _verifiedDocuments / _totalDocuments
+                                    : 0.0),
                             decoration: BoxDecoration(
                               borderRadius: BorderRadius.circular(4),
                               gradient: LinearGradient(
                                 colors: [
-                                  AppTheme.primaryColor,
-                                  AppTheme.primaryColor.withOpacity(0.8),
+                                  Colors.green,
+                                  Colors.green.withOpacity(0.8),
                                 ],
                               ),
                             ),
@@ -235,20 +313,22 @@ class _AppDrawerState extends State<AppDrawer> {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         Text(
-                          "Used",
+                          "Verified: $_verifiedDocuments",
                           style: GoogleFonts.poppins(
-                            textStyle: TextStyle(
+                            textStyle: const TextStyle(
                               fontSize: 12,
-                              color: Colors.grey.shade600,
+                              color: Colors.green,
+                              fontWeight: FontWeight.w500,
                             ),
                           ),
                         ),
                         Text(
-                          "Free",
+                          "Pending: $_pendingDocuments",
                           style: GoogleFonts.poppins(
-                            textStyle: TextStyle(
+                            textStyle: const TextStyle(
                               fontSize: 12,
-                              color: Colors.grey.shade600,
+                              color: Colors.blue,
+                              fontWeight: FontWeight.w500,
                             ),
                           ),
                         ),
@@ -259,7 +339,102 @@ class _AppDrawerState extends State<AppDrawer> {
               ),
             ],
           ),
+
+          // Document status breakdown
+          const SizedBox(height: 20),
+          Text(
+            "Document Status",
+            style: GoogleFonts.poppins(
+              textStyle: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: Colors.grey.shade800,
+              ),
+            ),
+          ),
+          // const SizedBox(height: 12),
+
+          // // Status cards
+          // Row(
+          //   children: [
+          //     // Verified documents
+          //     Expanded(
+          //       child: _buildStatusCard(
+          //         icon: Icons.verified,
+          //         color: Colors.green,
+          //         title: "Verified",
+          //         count: _verifiedDocuments,
+          //         onTap: () {
+          //           Navigator.pop(context);
+          //           // Navigate to Outbound tab in HomeScreen
+          //         },
+          //       ),
+          //     ),
+          //     const SizedBox(width: 8),
+          //     // Pending documents
+          //     Expanded(
+          //       child: _buildStatusCard(
+          //         icon: Icons.pending,
+          //         color: Colors.blue,
+          //         title: "Pending",
+          //         count: _pendingDocuments,
+          //         onTap: () {
+          //           Navigator.pop(context);
+          //           // Navigate to Inbound tab in HomeScreen and filter for pending
+          //         },
+          //       ),
+          //     ),
+          //   ],
+          // ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildStatusCard({
+    required IconData icon,
+    required Color color,
+    required String title,
+    required int count,
+    VoidCallback? onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: color.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: color.withOpacity(0.3)),
+        ),
+        child: Column(
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(icon, color: color, size: 16),
+                const SizedBox(width: 4),
+                Text(
+                  title,
+                  style: GoogleFonts.poppins(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                    color: color,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(
+              count.toString(),
+              style: GoogleFonts.poppins(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                color: Colors.grey.shade800,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -272,35 +447,43 @@ class _AppDrawerState extends State<AppDrawer> {
         'onTap': () => Navigator.pop(context),
       },
       {
-        'icon': Icons.favorite_rounded,
-        'title': 'Favorites',
+        'icon': Icons.verified_rounded,
+        'title': 'Verification Queue',
         'onTap': () {
           Navigator.pop(context);
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Favorites coming soon')),
-          );
-        },
-      },
-      {
-        'icon': Icons.access_time_rounded,
-        'title': 'Recent Files',
-        'onTap': () {
-          Navigator.pop(context);
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Recent files coming soon')),
-          );
-        },
-      },
-      {
-        'icon': Icons.delete_rounded,
-        'title': 'Trash',
-        'onTap': () {
-          Navigator.pop(context);
-          ScaffoldMessenger.of(
+          Navigator.push(
             context,
-          ).showSnackBar(const SnackBar(content: Text('Trash coming soon')));
+            MaterialPageRoute(
+              builder:
+                  (context) => VerificationQueueScreen(
+                    apiService: widget.apiService,
+                    documents: widget.documents,
+                    onDocumentUpdated: widget.onDocumentUpdated,
+                  ),
+            ),
+          );
         },
       },
+      // {
+      //   'icon': Icons.access_time_rounded,
+      //   'title': 'Recent Files',
+      //   'onTap': () {
+      //     Navigator.pop(context);
+      //     ScaffoldMessenger.of(context).showSnackBar(
+      //       const SnackBar(content: Text('Recent files coming soon')),
+      //     );
+      //   },
+      // },
+      // {
+      //   'icon': Icons.delete_rounded,
+      //   'title': 'Trash',
+      //   'onTap': () {
+      //     Navigator.pop(context);
+      //     ScaffoldMessenger.of(
+      //       context,
+      //     ).showSnackBar(const SnackBar(content: Text('Trash coming soon')));
+      //   },
+      // },
     ];
 
     final List<Map<String, dynamic>> settingsItems = [
@@ -319,8 +502,9 @@ class _AppDrawerState extends State<AppDrawer> {
         'title': 'Help & Support',
         'onTap': () {
           Navigator.pop(context);
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Help & Support coming soon')),
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (context) => HelpSupportScreen()),
           );
         },
       },
